@@ -13,18 +13,21 @@ import (
 	"time"
 )
 
-var passwdfile = flag.String("passwd", "/home/pi/passwd", "Password file to check")
-var timeout = flag.Duration("timeout", 10*time.Minute, "Timeout")
-var datadir = flag.String("datadir", "/home/pi/data", "The dir containing the hash tree.")
-var prefixlen = flag.Uint("prefixlen", 8, "Prefix length to use for generating hash tree.")
-var splitlen = flag.Uint("splitlen", 2, "Path length")
-var debug = flag.Bool("debug", false, "Turn on debug.")
-var rules = `
+var (
+	passwdfile = flag.String("passwd", "/home/pi/passwd", "Password file to check")
+	timeout    = flag.Duration("timeout", 10*time.Minute, "Timeout")
+	datadir    = flag.String("datadir", "/home/pi/data", "The dir containing the hash tree.")
+	update     = flag.Bool("update", false, "Update the datadir")
+	prefixlen  = flag.Uint("prefixlen", 8, "Prefix length to use for generating hash tree.")
+	splitlen   = flag.Uint("splitlen", 2, "Path length")
+	debug      = flag.Bool("debug", false, "Turn on debug.")
+	rules      = `
 The rules are these:
 1. -1 for missing
 2. +1 points for each valid hash
 3. Add bonus for rare passwords that only occur twice as in 04E2B8C988822005B768843B50A08BABDBA654FD:2
 `
+)
 
 // exists checks if a file or directory exists.
 func exists(path string) bool {
@@ -71,7 +74,7 @@ func mkTreeEntry(splitter func(string) []string, key, val string) error {
 		if fh, err := os.Create(t); err != nil {
 			return err
 		} else {
-
+			fh.Write([]byte(val + "\n"))
 			defer fh.Close()
 		}
 	} else {
@@ -87,10 +90,10 @@ func mkTreeEntry(splitter func(string) []string, key, val string) error {
 }
 
 func getHash(h string) ([]byte, error) {
-	p := splitN(*splitlen)(h)
+	p := splitN(*splitlen)(h[:*prefixlen])
 	path := *datadir + "/" + strings.Join(p, "/") + "/v"
 	if !exists(path) {
-		return nil, fmt.Errorf("%s not found", h)
+		return nil, fmt.Errorf("%s (%s) not found", h, path)
 	}
 	if dat, err := ioutil.ReadFile(path); err != nil {
 		return nil, err
@@ -192,6 +195,7 @@ func main() {
 						fmt.Println(err)
 						return
 					}
+					fmt.Printf("compare \"%s\" to \"%s\"\n", k, h)
 					if k == h {
 						e := float32(2) * float32(1/float32(extra))
 						score += 1
