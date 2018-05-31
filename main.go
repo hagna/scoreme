@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -13,19 +15,123 @@ import (
 
 var passwdfile = flag.String("passwd", "/home/pi/passwd", "Password file to check")
 var timeout = flag.Duration("timeout", 10*time.Minute, "Timeout")
+var datadir = flag.String("datadir", "/home/pi/data", "The dir containing the hash tree.")
+var prefixlen = flag.Uint("prefixlen", 8, "Prefix length to use for generating hash tree.")
+var splitlen = flag.Uint("splitlen", 2, "Path length")
 var debug = flag.Bool("debug", false, "Turn on debug.")
 var rules = `
 The rules are these:
 1. -1 for missing
-2. +1/n points for each valid hash (04E2B8C988822005B768843B50A08BABDBA654FD:2 <-- n is 2 here)
+2. +1 points for each valid hash
+3. Add bonus for rare passwords that only occur twice as in 04E2B8C988822005B768843B50A08BABDBA654FD:2
 `
+
+// exists checks if a file or directory exists.
+func exists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	if err == nil {
+		return true
+	}
+	if !os.IsNotExist(err) {
+		return false
+	}
+	return false
+}
+
+func splitN(n uint) func(string) []string {
+	return func(a string) []string {
+		var res []string
+		var i uint
+		for i = 0; i < uint(len(a)); i += n {
+			if uint(len(a[i:])) < n {
+				res = append(res, a[i:])
+			} else {
+				res = append(res, a[i:i+n])
+			}
+		}
+		return res
+	}
+}
+
+func NewTreeEntry(key, val string) error {
+	return mkTreeEntry(splitN(*splitlen), key, val)
+}
+
+func mkTreeEntry(splitter func(string) []string, key, val string) error {
+	p := splitter(key)
+	path := *datadir + "/" + strings.Join(p, "/")
+	if err := os.MkdirAll(path, 0744); err != nil {
+		return err
+	}
+	t := path + "/v"
+	if !exists(t) {
+		if fh, err := os.Create(t); err != nil {
+			return err
+		} else {
+
+			defer fh.Close()
+		}
+	} else {
+		if dat, err := ioutil.ReadFile(t); err != nil {
+			return err
+		} else {
+			if err := ioutil.WriteFile(t, append(dat, []byte(fmt.Sprintf("%s\n", val))...), 0644); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func getHash(h string) ([]byte, error) {
+	p := splitN(*splitlen)(h)
+	path := *datadir + "/" + strings.Join(p, "/") + "/v"
+	if !exists(path) {
+		return nil, fmt.Errorf("%s not found", h)
+	}
+	if dat, err := ioutil.ReadFile(path); err != nil {
+		return nil, err
+	} else {
+		return dat, err
+	}
+}
 
 func main() {
 	flag.Parse()
 	var score int
 	var escore float32
-	s := bufio.NewScanner(os.Stdin)
 	var hashes []string
+
+	if !exists(*datadir) {
+		fmt.Printf("%s doesn't exist so creating the index there.\n", *datadir)
+		pfile, err := os.Open(*passwdfile)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer pfile.Close()
+		p := bufio.NewScanner(pfile)
+		for {
+			if ok := p.Scan(); !ok {
+				err := p.Err()
+				if err != nil {
+					fmt.Println(err)
+				}
+				break
+			}
+			l := strings.TrimSpace(p.Text())
+			if err := NewTreeEntry(l[:*prefixlen], l); err != nil {
+				fmt.Println(err)
+				break
+			}
+		}
+		return
+	}
+
+	s := bufio.NewScanner(os.Stdin)
 	for {
 
 		if ok := s.Scan(); !ok {
@@ -41,6 +147,7 @@ func main() {
 	if *debug {
 		fmt.Printf("opening %s\n", *passwdfile)
 	}
+
 	pfile, err := os.Open(*passwdfile)
 	if err != nil {
 		fmt.Println(err)
@@ -63,41 +170,39 @@ func main() {
 	}
 	done := make(chan bool)
 	go func() {
-		p := bufio.NewScanner(pfile)
-		for {
-			if ok := p.Scan(); !ok {
-				err := p.Err()
-				if err != nil {
-					fmt.Println(err)
-				}
-				break
-			}
-			l := p.Text()
-			f := strings.Split(strings.TrimSpace(l), ":")
-			line := f[0]
-			extra, err := strconv.Atoi(f[1])
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			if newval, ok := hash[line]; ok {
-				e := float32(2) * float32(1/float32(extra))
-				if *debug {
-					fmt.Printf("extra points 1/%d %f %f %f\n", extra, e, newval.extra, hash[line].extra)
-				}
-				newval.score += 2
-				newval.extra += e
-				hash[line] = newval
-
-			}
-
-		}
 		for k, v := range hash {
-			if *debug {
-				fmt.Printf("%s: %d\n", k, v)
+			if dat, err := getHash(k); err != nil {
+				fmt.Println(err)
+				continue
+			} else {
+				p := bufio.NewScanner(bytes.NewReader(dat))
+				for {
+					if ok := p.Scan(); !ok {
+						err := p.Err()
+						if err != nil {
+							fmt.Println(err)
+						}
+						break
+					}
+					l := p.Text()
+					f := strings.Split(strings.TrimSpace(l), ":")
+					h := f[0]
+					extra, err := strconv.Atoi(f[1])
+					if err != nil {
+						fmt.Println(err)
+						return
+					}
+					if k == h {
+						e := float32(2) * float32(1/float32(extra))
+						score += 1
+						escore += e
+
+					}
+				}
+				if *debug {
+					fmt.Printf("%s: %d\n", k, v)
+				}
 			}
-			score += v.score
-			escore += v.extra
 
 		}
 		fmt.Printf("Score is %d (%.2f).\n", score, escore)
