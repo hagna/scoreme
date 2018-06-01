@@ -4,9 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"encoding/hex"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"github.com/boltdb/bolt"
 	"os"
 	"strconv"
 	"strings"
@@ -14,10 +15,11 @@ import (
 )
 
 var (
+	MYBUCKET   = flag.String("bucketname", "bucket1", "Bucket name for boltdb.")
+	dbname     = flag.String("dbname", "dat.db", "Database name for boltdb.")
 	passwdfile = flag.String("passwd", os.Getenv("HOME")+"/passwd", "Password file to check")
 	timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout")
-	datadir    = flag.String("datadir", os.Getenv("HOME")+"/data", "The dir containing the hash tree.")
-	update     = flag.Bool("update", false, "Update the datadir")
+	update     = flag.Bool("update", false, "Update db")
 	prefixlen  = flag.Uint("prefixlen", 8, "Prefix length to use for generating hash tree.")
 	splitlen   = flag.Uint("splitlen", 2, "Path length")
 	debug      = flag.Bool("debug", false, "Turn on debug.")
@@ -66,47 +68,75 @@ func splitN(n uint) func(string) []string {
 	}
 }
 
-func NewTreeEntry(key, val string) error {
-	return mkTreeEntry(splitN(*splitlen), key, val)
+func NewTreeEntry(db *bolt.DB, key, val string) error {
+	return mkTreeEntry(db, splitN(*splitlen), key, val)
 }
 
-func mkTreeEntry(splitter func(string) []string, key, val string) error {
-	p := splitter(key)
-	path := *datadir + "/" + strings.Join(p, "/")
-	if err := os.MkdirAll(path, 0744); err != nil {
+func mkTreeEntry(db *bolt.DB, dbsplitter func(string) []string, key, val string) error {
+	bkey, err := hex.DecodeString(key)
+	if err != nil {
 		return err
 	}
-	t := path + "/v"
-	if !exists(t) {
-		if fh, err := os.Create(t); err != nil {
+	i := strings.Index(val, ":")
+	if i == -1 {
+		return fmt.Errorf("No \":\" in value \"%s\"", val)
+	}
+	bval, err := hex.DecodeString(val[:i])
+	if err != nil {
+		return err
+	}
+	bval = append(bval, []byte(val[i:])...)
+
+	t := bkey
+	var existingvalue []byte
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(*MYBUCKET))
+		v := b.Get(t)
+		existingvalue = v
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if existingvalue == nil {
+		err := db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte(*MYBUCKET))
+			err := b.Put(t, bval)
 			return err
-		} else {
-			fh.Write([]byte(val + "\n"))
-			defer fh.Close()
+		})
+		if err != nil {
+			return err
 		}
 	} else {
-		if dat, err := ioutil.ReadFile(t); err != nil {
+		newvalue := append(existingvalue, append([]byte("\n"), bval...)...)
+		err := db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte(*MYBUCKET))
+			err := b.Put(t, newvalue)
 			return err
-		} else {
-			if err := ioutil.WriteFile(t, append(dat, []byte(fmt.Sprintf("%s\n", val))...), 0644); err != nil {
-				return err
-			}
+		})
+		if err != nil {
+			return err
 		}
+
 	}
 	return nil
 }
 
-func getHash(h string) ([]byte, error) {
-	p := splitN(*splitlen)(h[:*prefixlen])
-	path := *datadir + "/" + strings.Join(p, "/") + "/v"
-	if !exists(path) {
-		return nil, fmt.Errorf("%s (%s) not found", h, path)
-	}
-	if dat, err := ioutil.ReadFile(path); err != nil {
+func getHash(db *bolt.DB, h string) ([]byte, error) {
+	var res []byte
+	bh, err := hex.DecodeString(h[:*prefixlen])
+	if err != nil {
 		return nil, err
-	} else {
-		return dat, err
 	}
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(*MYBUCKET))
+		res = b.Get(bh)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func main() {
@@ -116,12 +146,22 @@ func main() {
 	var escore float32
 	var hashes []string
 
-	if !exists(*datadir) || *update {
-		if !*update {
-			fmt.Printf("%s doesn't exist so creating the index there.\n", *datadir)
-		} else {
-			fmt.Print("Update\n")
+	db, err := bolt.Open(*dbname, 0644, nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(*MYBUCKET))
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
 		}
+		return nil
+	})
+	defer db.Close()
+	if *update {
+
+		fmt.Printf("Update %s\n", *dbname)
 		pfile, err := os.Open(*passwdfile)
 		if err != nil {
 			fmt.Println(err)
@@ -148,7 +188,7 @@ func main() {
 				break
 			}
 			l := strings.TrimSpace(p.Text())
-			if err := NewTreeEntry(l[:*prefixlen], l); err != nil {
+			if err := NewTreeEntry(db, l[:*prefixlen], l); err != nil {
 				fmt.Println(err)
 				break
 			}
@@ -192,7 +232,7 @@ func main() {
 	done := make(chan bool)
 	go func() {
 		for k, v := range hash {
-			if dat, err := getHash(k); err != nil {
+			if dat, err := getHash(db, k); err != nil {
 				if *debug {
 					fmt.Println(err)
 				}
@@ -207,7 +247,7 @@ func main() {
 						}
 						break
 					}
-					l := p.Text()
+					l := hex.EncodeToString(p.Bytes())
 					f := strings.Split(strings.TrimSpace(l), ":")
 					h := f[0]
 					extra, err := strconv.Atoi(f[1])
