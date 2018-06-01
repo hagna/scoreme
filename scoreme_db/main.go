@@ -16,7 +16,7 @@ import (
 
 var (
 	MYBUCKET   = flag.String("bucketname", "bucket1", "Bucket name for boltdb.")
-	dbname     = flag.String("dbname", "dat.db", "Database name for boltdb.")
+	dbname     = flag.String("dbname", "db", "Database name for boltdb.")
 	passwdfile = flag.String("passwd", os.Getenv("HOME")+"/passwd", "Password file to check")
 	timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout")
 	update     = flag.Bool("update", false, "Update db")
@@ -99,16 +99,20 @@ func mkTreeEntry(db *bolt.DB, dbsplitter func(string) []string, key, val string)
 		return err
 	}
 	if existingvalue == nil {
+
 		err := db.Update(func(tx *bolt.Tx) error {
 			b := tx.Bucket([]byte(*MYBUCKET))
-			err := b.Put(t, bval)
+			err := b.Put(t, append(bval, []byte("\n")...))
 			return err
 		})
 		if err != nil {
 			return err
 		}
+		if *debug {
+			fmt.Printf("Storing new value \nkey\n%s\nvalue\n%s\n", hex.Dump(t), hex.Dump(bval))
+		}
 	} else {
-		newvalue := append(existingvalue, append([]byte("\n"), bval...)...)
+		newvalue := append(existingvalue, append(bval, []byte("\n")...)...)
 		err := db.Update(func(tx *bolt.Tx) error {
 			b := tx.Bucket([]byte(*MYBUCKET))
 			err := b.Put(t, newvalue)
@@ -116,6 +120,9 @@ func mkTreeEntry(db *bolt.DB, dbsplitter func(string) []string, key, val string)
 		})
 		if err != nil {
 			return err
+		}
+		if *debug {
+			fmt.Printf("Update value \nkey\n%s\nvalue\n%s\n", hex.Dump(t), hex.Dump(newvalue))
 		}
 
 	}
@@ -131,12 +138,40 @@ func getHash(db *bolt.DB, h string) ([]byte, error) {
 	err = db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(*MYBUCKET))
 		res = b.Get(bh)
+		if *debug {
+			fmt.Printf("found hash for key\n%s\nvalue\n%s\n", hex.Dump(bh), hex.Dump(res))
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+const HASHLEN = 20
+
+func ppsplitter(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if len(data) >= HASHLEN+1 {
+		i := bytes.Index(data[HASHLEN+1:], []byte("\n")) + HASHLEN + 1
+		if i == -1 {
+			return 0, nil, nil
+		}
+		if atEOF {
+			advance = 0
+		} else {
+			advance = i + 1
+		}
+		err = nil
+		token = data[:i]
+		return
+	} else {
+		if atEOF {
+			return 0, nil, nil
+		}
+		return 0, []byte{}, fmt.Errorf("Data is not long enough to advance")
+	}
+
 }
 
 func main() {
@@ -239,21 +274,28 @@ func main() {
 				continue
 			} else {
 				p := bufio.NewScanner(bytes.NewReader(dat))
+				p.Split(ppsplitter)
 				for {
 					if ok := p.Scan(); !ok {
 						err := p.Err()
 						if err != nil {
+							fmt.Println("ERROR scanning")
 							fmt.Println(err)
 						}
 						break
 					}
-					l := hex.EncodeToString(p.Bytes())
-					f := strings.Split(strings.TrimSpace(l), ":")
-					h := f[0]
-					extra, err := strconv.Atoi(f[1])
+					rec := p.Bytes()
+					i := bytes.LastIndex(rec, []byte(":"))
+					if i == -1 {
+						fmt.Printf("No \":\" found in stored value \n%s\n", hex.Dump(rec))
+						break
+					}
+					hash := strings.ToUpper(hex.EncodeToString(rec[:i]))
+					h := hash
+					extra, err := strconv.Atoi(string(rec[i+1:]))
 					if err != nil {
 						fmt.Println(err)
-						return
+						break
 					}
 					if *debug {
 						fmt.Printf("compare \"%s\" to \"%s\"\n", k, h)
