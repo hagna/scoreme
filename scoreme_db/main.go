@@ -89,22 +89,16 @@ func mkTreeEntry(db *bolt.DB, dbsplitter func(string) []string, key, val string)
 
 	t := bkey
 	var existingvalue []byte
-	err = db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(*MYBUCKET))
-		v := b.Get(t)
-		existingvalue = v
-		return nil
-	})
+	tx, err := db.Begin(true)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	b := tx.Bucket([]byte(*MYBUCKET))
+	v := b.Get(t)
+	existingvalue = v
 	if existingvalue == nil {
-
-		err := db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket([]byte(*MYBUCKET))
-			err := b.Put(t, append(bval, []byte("\n")...))
-			return err
-		})
+		err := b.Put(t, append(bval, []byte("\n")...))
 		if err != nil {
 			return err
 		}
@@ -113,11 +107,7 @@ func mkTreeEntry(db *bolt.DB, dbsplitter func(string) []string, key, val string)
 		}
 	} else {
 		newvalue := append(existingvalue, append(bval, []byte("\n")...)...)
-		err := db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket([]byte(*MYBUCKET))
-			err := b.Put(t, newvalue)
-			return err
-		})
+		err := b.Put(t, newvalue)
 		if err != nil {
 			return err
 		}
@@ -125,6 +115,9 @@ func mkTreeEntry(db *bolt.DB, dbsplitter func(string) []string, key, val string)
 			fmt.Printf("Update value \nkey\n%s\nvalue\n%s\n", hex.Dump(t), hex.Dump(newvalue))
 		}
 
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -226,6 +219,9 @@ func main() {
 			if err := NewTreeEntry(db, l[:*prefixlen], l); err != nil {
 				fmt.Println(err)
 				break
+			}
+			if *debug {
+				fmt.Printf(".")
 			}
 			b--
 		}
