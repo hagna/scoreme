@@ -28,6 +28,7 @@ const (
 )
 
 var (
+	HITS       []string
 	addr       = flag.String("addr", ":8080", "Easy mode webserver addr")
 	ezmode     = flag.Bool("easy", false, "Use easy mode.")
 	MYBUCKET   = flag.String("bucketname", "bucket1", "Bucket name for boltdb.")
@@ -44,6 +45,7 @@ var (
 The rules are these:
 1. -1 for missing
 2. +1 points for each valid hash
+2. -1 for duplicate.
 3. Add bonus for rare passwords that only occur twice as in 04E2B8C988822005B768843B50A08BABDBA654FD:2
 `
 	usage = func() {
@@ -52,6 +54,15 @@ The rules are these:
 		fmt.Fprintf(flag.CommandLine.Output(), rules)
 	}
 )
+
+func alreadyhit(a string) bool {
+	for _, v := range HITS {
+		if v == a {
+			return true
+		}
+	}
+	return false
+}
 
 type Hashes struct {
 	buf        []byte
@@ -157,9 +168,7 @@ func findHash(scorechan chan int, escorechan chan float32, db *bolt.DB, fh io.Re
 			break
 
 		}
-		if *ezmode {
-			fmt.Printf("checking \"%s\"\n", s.Text())
-		}
+
 		k := fmt.Sprintf("%X", sha1.Sum(s.Bytes()))
 
 		if dat, err := getHash(db, k); err != nil {
@@ -185,14 +194,22 @@ func findHash(scorechan chan int, escorechan chan float32, db *bolt.DB, fh io.Re
 				rec := dat[i*RECORDLEN : i*RECORDLEN+RECORDLEN]
 				a := strings.ToUpper(hex.EncodeToString(rec[:HASHLEN]))
 				if a == k {
-					scorechan <- POINT
-					extra, err := strconv.Atoi(strings.TrimSpace(string(rec[HASHLEN+1:])))
-					if err != nil {
-						fmt.Println(err)
-						break
+					if alreadyhit(a) {
+						scorechan <- -POINT
+					} else {
+						HITS = append(HITS, a)
+						if *ezmode {
+							fmt.Printf("%s\n", s.Text())
+						}
+						scorechan <- POINT
+						extra, err := strconv.Atoi(strings.TrimSpace(string(rec[HASHLEN+1:])))
+						if err != nil {
+							fmt.Println(err)
+							break
+						}
+						e := float32(POINT) * float32(1/float32(extra))
+						escorechan <- e
 					}
-					e := float32(POINT) * float32(1/float32(extra))
-					escorechan <- e
 				} else {
 					scorechan <- -POINT
 				}
